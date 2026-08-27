@@ -52,6 +52,36 @@ def discount_stack(
     return cache_mult * batch_mult
 
 
+def cache_is_worth_it(
+    avg_reads: float,
+    write_cost: float = 1.25,
+    read_discount: float = 0.10,
+) -> bool:
+    """Whether caching is cheaper than serving the same prompt uncached.
+
+    Costs are expressed relative to one ordinary input read.  Creating a cache
+    entry can cost more than that read (``write_cost``); each later cache read
+    costs ``read_discount``.  The comparison includes the initial ordinary
+    request, so it deliberately answers the practical question: *will this
+    prompt be reused often enough to recover its cache-write cost?*
+    """
+    reads = max(0.0, float(avg_reads))
+    write = max(0.0, float(write_cost))
+    discount = max(0.0, min(1.0, float(read_discount)))
+    cached_total = write + reads * discount
+    uncached_total = 1.0 + reads
+    return cached_total < uncached_total
+
+
+def cache_break_even_reads(write_cost: float = 1.25, read_discount: float = 0.10) -> float:
+    """Minimum additional reads required for a cache entry to pay for itself."""
+    write = max(0.0, float(write_cost))
+    discount = max(0.0, min(1.0, float(read_discount)))
+    if discount >= 1.0:
+        return float("inf")
+    return max(0.0, (write - 1.0) / (1.0 - discount))
+
+
 def break_even_utilization(discount_frac: float) -> float:
     """Utilization at which a commitment pays off ~= 1 - discount.
 
@@ -101,4 +131,113 @@ def spot_checkpoint_cost(
         "spot_cost": round(spot_cost, 2),
         "on_demand_cost": round(on_demand_cost, 2),
         "savings_pct": round(savings_pct, 1),
+    }
+
+
+# --- Your Turn #3: cache economics -------------------------------------------
+# Two cache TTL policies with different write premiums.  A 5-minute entry is
+# cheap to create; an extended (1-hour) entry costs roughly twice a normal read
+# to write, so it needs far more reuse before it pays for itself.
+CACHE_TTL_POLICIES = {
+    "5-min": 1.25,
+    "1-hour": 2.00,
+}
+
+
+def cache_savings_per_million(
+    price_in_per_m: float,
+    avg_reads: float,
+    write_cost: float = 1.25,
+    read_discount: float = 0.10,
+) -> float:
+    """USD saved per 1M input tokens of a prompt that is re-read ``avg_reads`` times.
+
+    The break-even *read count* is price-independent, so both model tiers flip at
+    the same threshold — but the dollars at stake scale with the tier's input
+    price, which is why caching discipline matters most on the expensive tier.
+    """
+    reads = max(0.0, float(avg_reads))
+    write = max(0.0, float(write_cost))
+    discount = max(0.0, min(1.0, float(read_discount)))
+    uncached_units = 1.0 + reads
+    cached_units = write + reads * discount
+    return (uncached_units - cached_units) * float(price_in_per_m)
+
+
+# --- Your Turn #1: risk-adjusted purchasing policy ---------------------------
+# Per-hour spot interruption rate by GPU type.  Scarce top-end accelerators get
+# reclaimed far more often than commodity inference cards.
+SPOT_INTERRUPT_RATE = {
+    "B200": 0.12,
+    "H200": 0.10,
+    "H100": 0.08,
+    "MI300X": 0.06,
+    "A100": 0.05,
+    "A10G": 0.02,
+    "L4": 0.015,
+}
+# A 3-year lock-in is only defensible for a workload that is already proven
+# steady; anything below these thresholds commits for 1 year instead.
+COMMIT_3YR_MIN_DUTY = 0.90
+COMMIT_3YR_MIN_DAYS = 30
+
+
+def recommend_tier_v2(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_hours: float,
+    prices: dict,
+    gpu_type: str | None = None,
+    days: float = 30,
+    interrupt_rate: float | None = None,
+) -> dict:
+    """Risk-adjusted tier choice: prices every option, then picks the cheapest.
+
+    Improves on :func:`recommend_tier` in two ways:
+
+    1. Spot is priced through :func:`spot_checkpoint_cost` with a *per-GPU-type*
+       interruption rate, so an H100 (reclaimed ~8%/h) is not assumed to be as
+       safe as an L4 (~1.5%/h).
+    2. Reserved is split into 1-year and 3-year commitments.  The 3-year rate is
+       only offered to workloads that clear both a duty-cycle and a duration
+       threshold; everything else pays the shallower 1-year discount rather than
+       locking a 36-month bill to a workload that may not exist next quarter.
+
+    Returns the tier, the commitment length, the modelled cost and a reason.
+    """
+    duty = max(0.0, hours_per_day) / 24.0
+    od_hr = float(prices["on_demand_hr"])
+    options = {"on_demand": {"cost": gpu_hours * od_hr, "commit_years": 0,
+                             "reason": "duty cycle too low or too risky to commit"}}
+
+    if interruptible:
+        rate = SPOT_INTERRUPT_RATE.get(gpu_type, 0.05) if interrupt_rate is None else interrupt_rate
+        sim = spot_checkpoint_cost(gpu_hours, float(prices["spot_hr"]), od_hr, interrupt_rate=rate)
+        options["spot"] = {
+            "cost": sim["spot_cost"], "commit_years": 0,
+            "reason": f"checkpointable; {rate:.1%}/h interruption priced in "
+                      f"({sim['spot_effective_hours']:.0f} effective GPU-h)",
+        }
+
+    steady_enough = duty >= COMMIT_3YR_MIN_DUTY and days >= COMMIT_3YR_MIN_DAYS
+    years = 3 if steady_enough else 1
+    res_hr = float(prices["reserved_3yr_hr"] if years == 3 else prices["reserved_1yr_hr"])
+    res_break_even = break_even_utilization(1.0 - res_hr / od_hr) if od_hr > 0 else 1.0
+    if duty >= res_break_even:
+        options["reserved"] = {
+            "cost": gpu_hours * res_hr, "commit_years": years,
+            "reason": f"duty {duty:.0%} clears the {res_break_even:.0%} break-even; "
+                      + ("proven steady -> 3yr lock-in" if years == 3
+                         else "not steady enough for 3yr -> 1yr commitment"),
+        }
+
+    tier = min(options, key=lambda k: options[k]["cost"])
+    chosen = options[tier]
+    return {
+        "tier": tier,
+        "commit_years": chosen["commit_years"],
+        "cost": chosen["cost"],
+        "reason": chosen["reason"],
+        "duty": duty,
+        "options": {k: round(v["cost"], 2) for k, v in options.items()},
     }

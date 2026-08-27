@@ -45,3 +45,36 @@ def tokens_per_watt(total_tokens: int, wh: float, seconds: float = 1.0) -> float
     """Energy efficiency of serving: tokens per watt (higher is better)."""
     watts = (wh * 3600.0) / seconds if seconds > 0 else 0.0
     return total_tokens / watts if watts > 0 else 0.0
+
+
+def region_comparison(wh: float) -> list[dict]:
+    """Return comparable electricity cost and carbon for every supported region."""
+    return [
+        {
+            "region": region,
+            "energy_cost_usd": energy_cost_usd(wh, region),
+            "carbon_g": carbon_g(wh, region),
+            "price_kwh": REGION_PRICE_KWH[region],
+            "carbon_kwh": REGION_CARBON[region],
+        }
+        for region in REGION_CARBON
+    ]
+
+
+# Illustrative round-trip latency (ms) from a US-East user base — the price you
+# pay for scheduling in the cleanest grid.
+REGION_LATENCY_MS = {
+    "us-east-1": 15,
+    "us-west-2": 70,
+    "europe-north1": 110,
+    "europe-central2": 120,
+    "us-east-wa": 65,
+}
+
+
+def region_scorecard(wh: float) -> list[dict]:
+    """Region comparison enriched with latency, for the cost/carbon/latency trade-off."""
+    rows = region_comparison(wh)
+    for row in rows:
+        row["latency_ms"] = REGION_LATENCY_MS.get(row["region"], 0)
+    return rows

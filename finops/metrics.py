@@ -61,3 +61,64 @@ def flag_util_lies(rows, util_threshold: float = 0.90, mfu_threshold: float = 0.
 def idle_waste_usd(idle_hours: float, on_demand_hr: float) -> float:
     """Dollars burned by a GPU left running idle (training done, instance up)."""
     return max(0.0, idle_hours) * max(0.0, on_demand_hr)
+
+
+# --- Your Turn #2: right-sizing memory-bound GPUs ----------------------------
+def dollars_per_gb_vram(on_demand_hr: float, hbm_gb: float) -> float:
+    """$/hour per GB of HBM — the unit price that matters for KV-cache capacity."""
+    return on_demand_hr / hbm_gb if hbm_gb > 0 else float("inf")
+
+
+def dollars_per_tbs(on_demand_hr: float, peak_bw_tbs: float) -> float:
+    """$/hour per TB/s of HBM bandwidth — the unit price of decode throughput."""
+    return on_demand_hr / peak_bw_tbs if peak_bw_tbs > 0 else float("inf")
+
+
+def is_memory_bound(mfu: float, mbu: float, margin: float = 1.05) -> bool:
+    """A GPU whose bandwidth utilisation outruns its FLOPs utilisation is decode-bound.
+
+    Buying more FLOPs for such a GPU changes nothing: the bottleneck is moving
+    weights and KV-cache through HBM, not the tensor cores.
+    """
+    return mbu > mfu * margin
+
+
+def rightsize_candidate(current_type: str, catalog: dict, achieved_bw_tbs: float,
+                        vram_needed_gb: float, headroom: float = 1.20) -> dict | None:
+    """Cheapest GPU that still covers the observed bandwidth and memory footprint.
+
+    ``catalog`` maps gpu_type -> dict with ``on_demand_hr``, ``hbm_gb`` and
+    ``peak_bw_tbs``.  Returns None when the current GPU is already the cheapest
+    box that fits — the honest answer for a well-sized workload.
+    """
+    current = catalog.get(current_type)
+    if not current:
+        return None
+    cur_hr = float(current["on_demand_hr"])
+    need_bw = achieved_bw_tbs * headroom
+    need_gb = vram_needed_gb * headroom
+
+    best = None
+    for gtype, row in catalog.items():
+        hr = float(row["on_demand_hr"])
+        if hr >= cur_hr:
+            continue
+        if float(row["peak_bw_tbs"]) < need_bw or float(row["hbm_gb"]) < need_gb:
+            continue
+        if best is None or hr < float(catalog[best]["on_demand_hr"]):
+            best = gtype
+    if best is None:
+        return None
+    new_hr = float(catalog[best]["on_demand_hr"])
+    return {
+        "from": current_type,
+        "to": best,
+        "from_hr": cur_hr,
+        "to_hr": new_hr,
+        "hourly_savings": cur_hr - new_hr,
+        "savings_pct": (1.0 - new_hr / cur_hr) * 100.0,
+        "from_usd_per_gb": dollars_per_gb_vram(cur_hr, float(current["hbm_gb"])),
+        "to_usd_per_gb": dollars_per_gb_vram(new_hr, float(catalog[best]["hbm_gb"])),
+        "from_usd_per_tbs": dollars_per_tbs(cur_hr, float(current["peak_bw_tbs"])),
+        "to_usd_per_tbs": dollars_per_tbs(new_hr, float(catalog[best]["peak_bw_tbs"])),
+    }
